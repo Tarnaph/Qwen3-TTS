@@ -1,0 +1,45 @@
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+.idea/
+.vscode/
+venv/
+env/
+
+# Model weights (large files — download separately via huggingface-cli)
+Qwen3-TTS-12Hz-1.7B-Base/
+Qwen3-TTS-12Hz-1.7B-CustomVoice/
+Qwen3-TTS-12Hz-1.7B-VoiceDesign/
+Qwen3-TTS-12Hz-0.6B-Base/
+Qwen3-TTS-12Hz-0.6B-CustomVoice/
+Qwen3-TTS-Tokenizer-12Hz/
+
+# Generated audio output
+*.wav
+*.mp3
+*.mp4
+
+# Logs and temp files
+error_log.txt
+*.log
+*.pt
+
+# SSL certs
+*.pem

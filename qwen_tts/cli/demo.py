@@ -258,7 +258,9 @@ def _parse_srt(content: str) -> List[Tuple[int, str]]:
         except ValueError:
             continue
         # skip the timecode line (lines[1]), join remaining as text
-        text = " ".join(line.strip() for line in lines[2:] if line.strip())
+        raw = " ".join(line.strip() for line in lines[2:] if line.strip())
+        # Strip HTML tags that SRT files sometimes contain (e.g. <i>, <b>, <font color=...>)
+        text = re.sub(r"<[^>]+>", "", raw).strip()
         if text:
             entries.append((idx, text))
     return entries
@@ -270,6 +272,22 @@ def _detect_model_kind(ckpt: str, tts: Qwen3TTSModel) -> str:
         return mt
     else:
         raise ValueError(f"Unknown Qwen-TTS model type: {mt}")
+
+
+def _vram_status() -> str:
+    """Return a compact VRAM usage string, e.g. 'VRAM: 4.2/8.0 GB (52%)'.
+    Returns empty string if CUDA is not available."""
+    if not torch.cuda.is_available():
+        return ""
+    used = torch.cuda.memory_allocated() / 1024**3
+    reserved = torch.cuda.memory_reserved() / 1024**3
+    total = torch.cuda.get_device_properties(0).total_memory / 1024**3
+    pct = int(reserved / total * 100) if total > 0 else 0
+    return f"VRAM {reserved:.1f}/{total:.0f}GB ({pct}%)"
+
+
+# Lazy-loaded VoiceDesign model (loads on first use, avoids startup delay)
+_vd_tts: Optional[Qwen3TTSModel] = None
 
 
 def build_demo(tts: Qwen3TTSModel, ckpt: str, gen_kwargs_default: Dict[str, Any]) -> gr.Blocks:
@@ -693,7 +711,8 @@ Choose the voice source: **Reference Audio** (raw audio) or **Load Voice File** 
                             )
                             srt_status = gr.Textbox(
                                 label="Log / Status (日志/状态)",
-                                lines=12,
+                                lines=20,
+                                max_lines=40,
                                 interactive=False,
                             )
 
@@ -702,10 +721,10 @@ Choose the voice source: **Reference Audio** (raw audio) or **Load Voice File** 
                         prompt_file_obj,
                         lang_disp: str, instruct: str,
                         srt_file_obj, out_dir: str, fmt: str,
-                        progress=gr.Progress(track_tqdm=False),
                     ):
                         import soundfile as sf
                         import subprocess
+                        import gc
 
                         try:
                             if srt_file_obj is None:
@@ -781,17 +800,25 @@ Choose the voice source: **Reference Audio** (raw audio) or **Load Voice File** 
                                 f"Voice source: {'Voice File (.pt)' if use_prompt_file else 'Reference Audio'}",
                                 f"Found {len(entries)} subtitle(s). Starting generation...\n",
                             ]
-                            progress(0, desc="Starting...")
                             yield 0, "\n".join(log_lines)
                             total_t0 = time.time()
 
                             for i, (idx, text) in enumerate(entries):
                                 pct = int(i / len(entries) * 100)
-                                progress(i / len(entries), desc=f"[{i+1}/{len(entries)}] Generating #{idx}...")
+
+                                # Skip entries that are too short to produce quality audio
+                                if len(text.split()) < 2:
+                                    log_lines.append(f"⚠️  [{i+1}/{len(entries)}] #{idx} — Skipped (text too short: {repr(text)})")
+                                    done_pct = int((i + 1) / len(entries) * 100)
+                                    yield done_pct, "\n".join(log_lines[-40:])
+                                    continue
+
                                 preview_pre = text[:50] + "..." if len(text) > 50 else text
-                                log_lines.append(f"⏳ [{i+1}/{len(entries)}] #{idx} — Generating: {preview_pre}")
-                                yield pct, "\n".join(log_lines)
-                                log_lines.pop()  # remove the ⏳ line before adding result
+                                vram_info = _vram_status()
+                                vram_tag = f" [{vram_info}]" if vram_info else ""
+                                pending_line = f"⏳ [{i+1}/{len(entries)}] #{idx}{vram_tag} — Generating: {preview_pre}"
+                                log_lines.append(pending_line)
+                                yield pct, "\n".join(log_lines[-40:])
                                 t0 = time.time()
                                 try:
                                     gen_kwargs = dict(
@@ -807,7 +834,34 @@ Choose the voice source: **Reference Audio** (raw audio) or **Load Voice File** 
                                         gen_kwargs["ref_text"] = (ref_txt.strip() if ref_txt else None)
                                         gen_kwargs["x_vector_only_mode"] = bool(use_xvec)
 
-                                    wavs, sr = tts.generate_voice_clone(**gen_kwargs)
+                                    # [Option B] Dynamic max_new_tokens: cap based on text length.
+                                    # ~70 audio tokens per word is a safe upper bound for Qwen3-TTS.
+                                    # Prevents infinite generation loops on edge-case texts.
+                                    if "max_new_tokens" not in gen_kwargs or gen_kwargs.get("max_new_tokens") is None:
+                                        word_count = max(len(text.split()), 1)
+                                        gen_kwargs["max_new_tokens"] = min(word_count * 70 + 200, 4096)
+
+                                    # [Option A] Run generation in a thread with a hard timeout.
+                                    # If the model hangs (OOM deadlock, infinite loop, CUDA stall),
+                                    # we skip the entry and continue the batch instead of freezing forever.
+                                    _GEN_TIMEOUT = 180  # seconds per entry
+                                    from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
+
+                                    def _run_generation():
+                                        with torch.no_grad():
+                                            return tts.generate_voice_clone(**gen_kwargs)
+
+                                    with ThreadPoolExecutor(max_workers=1) as _pool:
+                                        _fut = _pool.submit(_run_generation)
+                                        try:
+                                            wavs, sr = _fut.result(timeout=_GEN_TIMEOUT)
+                                        except FuturesTimeout:
+                                            raise RuntimeError(
+                                                f"Generation timed out after {_GEN_TIMEOUT}s — "
+                                                "entry skipped (possible CUDA stall or infinite loop)"
+                                            )
+
+
                                     elapsed = time.time() - t0
                                     ext = (fmt or "MP3").lower()
                                     wav_path = os.path.join(out_dir, f"{idx:04d}.wav")
@@ -832,17 +886,27 @@ Choose the voice source: **Reference Audio** (raw audio) or **Load Voice File** 
                                             log_lines.append(f"   ⚠️ ffmpeg error: {ce.stderr.decode(errors='replace')[:200]}")
                                             out_path = wav_path
                                     preview = text[:60] + "..." if len(text) > 60 else text
-                                    log_lines.append(f"✅ [{i+1}/{len(entries)}] #{idx} — {elapsed:.1f}s → {out_path}")
+                                    # Replace the ⏳ pending line with the ✅ result in-place
+                                    log_lines[-1] = f"✅ [{i+1}/{len(entries)}] #{idx} — {elapsed:.1f}s → {out_path}"
                                     log_lines.append(f"   {preview}")
                                 except Exception as e:
-                                    log_lines.append(f"❌ [{i+1}/{len(entries)}] #{idx} — FAILED: {type(e).__name__}: {e}")
+                                    log_lines[-1] = f"❌ [{i+1}/{len(entries)}] #{idx} — FAILED: {type(e).__name__}: {e}"
+                                finally:
+                                    # Free VRAM after each generation to prevent OOM accumulation
+                                    # on large SRT batches (60+ entries).
+                                    if torch.cuda.is_available():
+                                        torch.cuda.empty_cache()
+                                    gc.collect()
 
                                 done_pct = int((i + 1) / len(entries) * 100)
-                                yield done_pct, "\n".join(log_lines)
+                                # Cap log to last 40 lines to avoid rendering overhead on large batches
+                                yield done_pct, "\n".join(log_lines[-40:])
 
                             total_elapsed = time.time() - total_t0
-                            log_lines.append(f"\n🏁 Done! {len(entries)} file(s) in {total_elapsed:.1f}s → {out_dir}")
-                            yield 100, "\n".join(log_lines)
+                            vram_final = _vram_status()
+                            vram_suffix = f" | {vram_final}" if vram_final else ""
+                            log_lines.append(f"\n🏁 Done! {len(entries)} file(s) in {total_elapsed:.1f}s → {out_dir}{vram_suffix}")
+                            yield 100, "\n".join(log_lines[-40:])
 
                         except Exception as e:
                             yield 0, f"❌ {type(e).__name__}: {e}"
@@ -853,10 +917,402 @@ Choose the voice source: **Reference Audio** (raw audio) or **Load Voice File** 
                         outputs=[srt_progress_bar, srt_status],
                     )
 
+                with gr.Tab("🎨 Voice Design"):
+                    gr.Markdown(
+                        """
+### 🎨 Voice Design — Criar voz com descrição de estilo
+Descreva a voz que você quer: gênero, idade, tom emocional, ritmo, idioma nativo...  
+O modelo `Qwen3-TTS-12Hz-1.7B-VoiceDesign` é carregado **automaticamente** na primeira geração.  
+> ⚠️ Requer a pasta `Qwen3-TTS-12Hz-1.7B-VoiceDesign/` localmente (ou conexão com HuggingFace).
+"""
+                    )
+                    with gr.Row():
+                        # ── Coluna esquerda: inputs ──────────────────────────
+                        with gr.Column(scale=2):
+                            vd_text = gr.Textbox(
+                                label="📝 Texto para sintetizar (Text to Synthesize)",
+                                lines=5,
+                                placeholder="Digite o texto que será falado com a voz criada...\nEx: It's in the top drawer... wait, it's empty? No way!",
+                            )
+                            vd_lang = gr.Dropdown(
+                                label="🌐 Idioma (Language)",
+                                choices=lang_choices_disp or ["Auto"],
+                                value="Auto",
+                                interactive=True,
+                                info="Defina o idioma do texto. 'Auto' detecta automaticamente.",
+                            )
+                            vd_design = gr.Textbox(
+                                label="🎭 Descrição da voz (Voice Design Instruction)",
+                                lines=5,
+                                placeholder=(
+                                    "Descreva a voz em detalhes:\n"
+                                    "- Gênero: male / female\n"
+                                    "- Idade: e.g. '25 years old'\n"
+                                    "- Tom: calm / energetic / sad / angry / whispering\n"
+                                    "- Ritmo: slow / fast / natural\n"
+                                    "- Estilo: storyteller / news anchor / casual conversation\n"
+                                    "Ex: 'Female, 30, warm and calm narrator with a slight smile in the voice'"
+                                ),
+                                info="Quanto mais detalhada a descrição, melhor o resultado.",
+                            )
+
+                            gr.Examples(
+                                label="⚡ Exemplos rápidos (clique para carregar)",
+                                examples=[
+                                    ["It's in the top drawer... wait, it's empty? No way, that's impossible!",
+                                     "English",
+                                     "Female, 28 years old, disbelief turning into panic, voice slightly trembling, fast speech pattern"],
+                                    ["Welcome, and thank you for joining us today. Let's begin.",
+                                     "English",
+                                     "Male, 45 years old, deep calm baritone, professional news anchor style, clear articulation, slow and authoritative"],
+                                    ["Hey! Did you hear that? Something moved in the dark...",
+                                     "English",
+                                     "Female, 20 years old, terrified whispering, very low volume, tense and breathless, close-mic sensation"],
+                                    ["Haha! Come on, it'll be fun! Trust me on this one!",
+                                     "English",
+                                     "Male, 22 years old, cheerful and energetic, bright timbre, fast animated speech, enthusiastic"],
+                                    ["Não se preocupe. Tudo vai ficar bem, eu prometo.",
+                                     "Portuguese",
+                                     "Female, 35 years old, warm and comforting, slow reassuring tone, slightly soft voice, maternal feeling"],
+                                    ["Attention all units. We have a situation. Proceed with caution.",
+                                     "English",
+                                     "Male, 40 years old, military commander, tense and urgent, clipped speech, low and controlled"],
+                                ],
+                                inputs=[vd_text, vd_lang, vd_design],
+                            )
+
+                            with gr.Accordion("💾 Salvar saída (Save Output)", open=False):
+                                vd_out_dir = gr.Textbox(
+                                    label="Pasta de saída (Output Folder)",
+                                    placeholder="Ex: C:\\Users\\Voce\\Desktop\\vozes_criadas",
+                                    info="Deixe vazio para não salvar em arquivo. O áudio ainda aparece no player.",
+                                )
+
+                            vd_btn = gr.Button("🎨 Generate with Voice Design", variant="primary", size="lg")
+
+                        # ── Coluna direita: outputs ──────────────────────────
+                        with gr.Column(scale=3):
+                            vd_status = gr.Textbox(
+                                label="⏱️ Status",
+                                lines=3,
+                                interactive=False,
+                                value="Aguardando geração...",
+                            )
+                            vd_audio_out = gr.Audio(
+                                label="🔊 Áudio Gerado (Generated Audio)",
+                                type="numpy",
+                            )
+                            gr.Markdown(
+                                """
+**💡 Dica:** Após gerar, você pode usar este áudio como **referência na aba Clone & Generate**  
+para clonar este estilo de voz e sintetizar qualquer outro texto!
+"""
+                            )
+
+                    def run_voice_design_tab(
+                        text: str,
+                        lang_disp: str,
+                        design: str,
+                        out_dir: str,
+                        progress=gr.Progress(track_tqdm=False),
+                    ):
+                        import soundfile as sf
+                        global _vd_tts
+
+                        if not text or not text.strip():
+                            yield "❌ Texto é obrigatório.", None
+                            return
+                        if not design or not design.strip():
+                            yield "❌ Descrição da voz é obrigatória.", None
+                            return
+
+                        # Lazy load the VoiceDesign model
+                        if _vd_tts is None:
+                            progress(0, desc="Carregando modelo VoiceDesign...")
+                            yield "⏳ Carregando modelo VoiceDesign pela primeira vez...\n(pode demorar 1-2 minutos)", None
+                            try:
+                                import os as _os
+                                # Detect local path relative to the Base model checkpoint
+                                base_ckpt_dir = _os.path.dirname(_os.path.abspath(ckpt)) if _os.path.isdir(ckpt) else _os.path.dirname(ckpt)
+                                local_vd = _os.path.join(_os.path.dirname(_os.path.abspath(ckpt)), "..", "Qwen3-TTS-12Hz-1.7B-VoiceDesign")
+                                # Also try same directory as script
+                                local_vd2 = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "..", "..", "..", "Qwen3-TTS-12Hz-1.7B-VoiceDesign")
+                                vd_ckpt = None
+                                for candidate in [local_vd, local_vd2, "Qwen3-TTS-12Hz-1.7B-VoiceDesign", "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign"]:
+                                    normalized = _os.path.normpath(candidate)
+                                    if _os.path.isdir(normalized):
+                                        vd_ckpt = normalized
+                                        break
+                                if vd_ckpt is None:
+                                    vd_ckpt = "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign"  # fallback to HuggingFace
+
+                                device = gen_kwargs_default.get("device_map", "cuda:0") if "device_map" in gen_kwargs_default else "cuda:0"
+                                kwargs_load = {k: v for k, v in gen_kwargs_default.items() if k not in ("max_new_tokens",)}
+                                _vd_tts = Qwen3TTSModel.from_pretrained(
+                                    vd_ckpt,
+                                    device_map="cuda:0",
+                                    dtype=torch.bfloat16,
+                                    attn_implementation="eager",
+                                )
+                            except Exception as e:
+                                hint = (
+                                    "\n\n💡 Se o modelo não foi baixado ainda:\n"
+                                    "  huggingface-cli download Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign "
+                                    "--local-dir ./Qwen3-TTS-12Hz-1.7B-VoiceDesign"
+                                )
+                                yield f"❌ Falha ao carregar modelo VoiceDesign:\n{type(e).__name__}: {e}{hint}", None
+                                return
+
+                        progress(0.3, desc="Gerando áudio...")
+                        yield "⏳ Gerando áudio com Voice Design...", None
+                        t0 = time.time()
+                        try:
+                            language = lang_map.get(lang_disp, "Auto") if lang_map else lang_disp
+                            wavs, sr = _vd_tts.generate_voice_design(
+                                text=text.strip(),
+                                language=language,
+                                instruct=design.strip(),
+                            )
+                            elapsed = time.time() - t0
+                            progress(1.0, desc="Concluído!")
+
+                            # Save to file if requested
+                            saved_msg = ""
+                            if out_dir and out_dir.strip():
+                                import os as _os
+                                _os.makedirs(out_dir.strip(), exist_ok=True)
+                                import time as _time
+                                fname = f"vd_{int(_time.time())}.wav"
+                                fpath = _os.path.join(out_dir.strip(), fname)
+                                sf.write(fpath, wavs[0], sr)
+                                saved_msg = f"\n💾 Salvo em: {fpath}"
+
+                            yield f"✅ Concluído em {elapsed:.1f}s{saved_msg}", _wav_to_gradio_audio(wavs[0], sr)
+                        except Exception as e:
+                            yield f"❌ Erro na geração:\n{type(e).__name__}: {e}", None
+
+                    vd_btn.click(
+                        run_voice_design_tab,
+                        inputs=[vd_text, vd_lang, vd_design, vd_out_dir],
+                        outputs=[vd_status, vd_audio_out],
+                    )
+
+                with gr.Tab("🔀 Voice Blend"):
+                    gr.Markdown(
+                        """
+### 🔀 Voice Blend — Misturar duas vozes em uma
+Faça upload de dois áudios de referência e use o **slider** para controlar a proporção da mistura.  
+A combinação é feita matematicamente nos *speaker embeddings* (vetores de identidade) de cada voz.
+> 💡 **Dica:** Funciona melhor quando os dois áudios têm boa qualidade (5–15 segundos, sem ruído).
+"""
+                    )
+                    with gr.Row():
+                        # ── Coluna esquerda: inputs ──────────────────────────
+                        with gr.Column(scale=4):
+                            with gr.Row():
+                                with gr.Column():
+                                    gr.Markdown("#### 🎤 Voz A")
+                                    blend_ref_a = gr.Audio(
+                                        label="Áudio de Referência A",
+                                        type="numpy",
+                                    )
+                                    blend_txt_a = gr.Textbox(
+                                        label="Texto do Áudio A (Reference Text A)",
+                                        lines=2,
+                                        placeholder="O que foi dito no áudio A (opcional — deixe vazio para usar só o x-vector).",
+                                    )
+                                with gr.Column():
+                                    gr.Markdown("#### 🎤 Voz B")
+                                    blend_ref_b = gr.Audio(
+                                        label="Áudio de Referência B",
+                                        type="numpy",
+                                    )
+                                    blend_txt_b = gr.Textbox(
+                                        label="Texto do Áudio B (Reference Text B)",
+                                        lines=2,
+                                        placeholder="O que foi dito no áudio B (opcional — deixe vazio para usar só o x-vector).",
+                                    )
+
+                            blend_ratio = gr.Slider(
+                                label="🎚️ Proporção: ← 100% Voz A  |  100% Voz B →",
+                                minimum=0,
+                                maximum=100,
+                                value=50,
+                                step=1,
+                                info="0 = 100% Voz A  |  50 = Mistura igual  |  100 = 100% Voz B",
+                            )
+
+                            blend_text = gr.Textbox(
+                                label="📝 Texto para sintetizar (Target Text)",
+                                lines=4,
+                                placeholder="Digite o texto que você quer sintetizar com a voz misturada...",
+                            )
+                            blend_lang = gr.Dropdown(
+                                label="🌐 Idioma (Language)",
+                                choices=lang_choices_disp or ["Auto"],
+                                value="Auto",
+                                interactive=True,
+                            )
+                            blend_instruct = gr.Textbox(
+                                label="💬 Instrução de estilo (opcional)",
+                                lines=2,
+                                placeholder="Ex: Fale devagar e com calma. (não tem efeito no modelo Base)",
+                            )
+                            blend_btn = gr.Button("🔀 Generate Blended Voice", variant="primary", size="lg")
+
+                        # ── Coluna direita: outputs ──────────────────────────
+                        with gr.Column(scale=3):
+                            blend_status = gr.Textbox(
+                                label="⏱️ Status",
+                                lines=3,
+                                interactive=False,
+                                value="Aguardando geração...",
+                            )
+                            blend_audio_out = gr.Audio(
+                                label="🔊 Voz Misturada (Blended Voice)",
+                                type="numpy",
+                            )
+                            blend_file_out = gr.File(
+                                label="🎤 Arquivo de Voz Misturada (.pt) — clique para baixar"
+                            )
+                            gr.Markdown(
+                                """
+**ℹ️ Como funciona:**  
+1. Extrai o *speaker embedding* (identidade vocal) de cada áudio  
+2. Faz a média ponderada pelo slider  
+3. Gera o áudio com a identidade misturada  
+
+Tente variações de 30/70, 50/50, 70/30 para encontrar o blend perfeito!
+"""
+                            )
+
+                    def run_voice_blend(
+                        ref_a, txt_a: str,
+                        ref_b, txt_b: str,
+                        ratio: float,
+                        text: str, lang_disp: str, instruct: str,
+                        progress=gr.Progress(track_tqdm=False),
+                    ):
+                        """Blend two voice embeddings and synthesize target text."""
+                        if ref_a is None or ref_b is None:
+                            yield "❌ Ambos os áudios de referência são obrigatórios.", None, None
+                            return
+                        if not text or not text.strip():
+                            yield "❌ Texto alvo é obrigatório.", None, None
+                            return
+
+                        progress(0.1, desc="Extraindo embedding da Voz A...")
+                        yield "⏳ [1/4] Extraindo embedding da Voz A...", None, None
+
+                        try:
+                            at_a = _audio_to_tuple(ref_a)
+                            at_b = _audio_to_tuple(ref_b)
+                            if at_a is None:
+                                yield "❌ Áudio A inválido.", None, None
+                                return
+                            if at_b is None:
+                                yield "❌ Áudio B inválido.", None, None
+                                return
+
+                            kwargs = _gen_common_kwargs()
+                            txt_a_v = (txt_a or "").strip() or None
+                            txt_b_v = (txt_b or "").strip() or None
+
+                            # Extract prompt items for each voice
+                            items_a = tts.create_voice_clone_prompt(
+                                ref_audio=at_a,
+                                ref_text=txt_a_v,
+                                x_vector_only_mode=(txt_a_v is None),
+                            )
+
+                            progress(0.3, desc="Extraindo embedding da Voz B...")
+                            yield "⏳ [2/4] Extraindo embedding da Voz B...", None, None
+
+                            items_b = tts.create_voice_clone_prompt(
+                                ref_audio=at_b,
+                                ref_text=txt_b_v,
+                                x_vector_only_mode=(txt_b_v is None),
+                            )
+
+                            progress(0.55, desc="Misturando embeddings...")
+                            yield f"⏳ [3/4] Misturando embeddings (A={100-int(ratio)}% / B={int(ratio)}%)...", None, None
+
+                            # Weighted blend of speaker embeddings
+                            alpha = ratio / 100.0  # 0.0 = full A, 1.0 = full B
+                            spk_a = items_a[0].ref_spk_embedding.float()
+                            spk_b = items_b[0].ref_spk_embedding.float()
+                            blended_spk = ((1.0 - alpha) * spk_a + alpha * spk_b)
+
+                            # Use ref_code from whichever side dominates (or A if 50/50)
+                            dominant_items = items_a if alpha <= 0.5 else items_b
+                            blended_item = VoiceClonePromptItem(
+                                ref_code=dominant_items[0].ref_code,
+                                ref_spk_embedding=blended_spk,
+                                x_vector_only_mode=True,
+                                icl_mode=False,
+                                ref_text=None,
+                            )
+
+                            progress(0.7, desc="Sintetizando...")
+                            yield "⏳ [4/4] Sintetizando com a voz misturada...", None, None
+
+                            t0 = time.time()
+                            language = lang_map.get(lang_disp, "Auto") if lang_map else lang_disp
+                            instruct_val = (instruct or "").strip() or None
+                            wavs, sr = tts.generate_voice_clone(
+                                text=text.strip(),
+                                language=language,
+                                voice_clone_prompt=[blended_item],
+                                instruct=instruct_val,
+                                **kwargs,
+                            )
+                            elapsed = time.time() - t0
+                            progress(1.0, desc="Concluído!")
+
+                            pct_a = 100 - int(ratio)
+                            pct_b = int(ratio)
+
+                            # Auto-save blended voice as .pt (tempfile, same as Save/Load Voice tab)
+                            import os, tempfile, torch
+                            payload = {
+                                "items": [
+                                    {
+                                        "ref_code": blended_item.ref_code,
+                                        "ref_spk_embedding": blended_item.ref_spk_embedding,
+                                        "x_vector_only_mode": True,
+                                        "icl_mode": False,
+                                        "ref_text": None,
+                                    }
+                                ]
+                            }
+                            fd, pt_path = tempfile.mkstemp(
+                                prefix=f"blend_{pct_a}A_{pct_b}B_", suffix=".pt"
+                            )
+                            os.close(fd)
+                            torch.save(payload, pt_path)
+
+                            yield (
+                                f"✅ Concluído em {elapsed:.1f}s | Mix: {pct_a}% Voz A + {pct_b}% Voz B | Modo: x-vector blend"
+                            ), _wav_to_gradio_audio(wavs[0], sr), pt_path
+
+                        except Exception as e:
+                            yield f"❌ Erro: {type(e).__name__}: {e}", None, None
+
+                    blend_btn.click(
+                        run_voice_blend,
+                        inputs=[
+                            blend_ref_a, blend_txt_a,
+                            blend_ref_b, blend_txt_b,
+                            blend_ratio, blend_text, blend_lang, blend_instruct,
+                        ],
+                        outputs=[blend_status, blend_audio_out, blend_file_out],
+                    )
+
+
         gr.Markdown(
             """
 **Disclaimer (免责声明)**  
-- The audio is automatically generated/synthesized by an AI model solely to demonstrate the model’s capabilities; it may be inaccurate or inappropriate, does not represent the views of the developer/operator, and does not constitute professional advice. You are solely responsible for evaluating, using, distributing, or relying on this audio; to the maximum extent permitted by applicable law, the developer/operator disclaims liability for any direct, indirect, incidental, or consequential damages arising from the use of or inability to use the audio, except where liability cannot be excluded by law. Do not use this service to intentionally generate or replicate unlawful, harmful, defamatory, fraudulent, deepfake, or privacy/publicity/copyright/trademark‑infringing content; if a user prompts, supplies materials, or otherwise facilitates any illegal or infringing conduct, the user bears all legal consequences and the developer/operator is not responsible.
+- The audio is automatically generated/synthesized by an AI model solely to demonstrate the model's capabilities; it may be inaccurate or inappropriate, does not represent the views of the developer/operator, and does not constitute professional advice. You are solely responsible for evaluating, using, distributing, or relying on this audio; to the maximum extent permitted by applicable law, the developer/operator disclaims liability for any direct, indirect, incidental, or consequential damages arising from the use of or inability to use the audio, except where liability cannot be excluded by law. Do not use this service to intentionally generate or replicate unlawful, harmful, defamatory, fraudulent, deepfake, or privacy/publicity/copyright/trademark‑infringing content; if a user prompts, supplies materials, or otherwise facilitates any illegal or infringing conduct, the user bears all legal consequences and the developer/operator is not responsible.
 - 音频由人工智能模型自动生成/合成，仅用于体验与展示模型效果，可能存在不准确或不当之处；其内容不代表开发者/运营方立场，亦不构成任何专业建议。用户应自行评估并承担使用、传播或依赖该音频所产生的一切风险与责任；在适用法律允许的最大范围内，开发者/运营方不对因使用或无法使用本音频造成的任何直接、间接、附带或后果性损失承担责任（法律另有强制规定的除外）。严禁利用本服务故意引导生成或复制违法、有害、诽谤、欺诈、深度伪造、侵犯隐私/肖像/著作权/商标等内容；如用户通过提示词、素材或其他方式实施或促成任何违法或侵权行为，相关法律后果由用户自行承担，与开发者/运营方无关。
 """
         )
@@ -898,7 +1354,13 @@ def main(argv=None) -> int:
     if args.ssl_keyfile is not None:
         launch_kwargs["ssl_keyfile"] = args.ssl_keyfile
 
-    demo.queue(default_concurrency_limit=int(args.concurrency)).launch(**launch_kwargs)
+    # [Option C] Gradio queue: fast heartbeat so Gradio doesn't kill long-running
+    # SRT batch generators. status_update_rate=5 sends keep-alive to browser every 5s.
+    demo.queue(
+        default_concurrency_limit=int(args.concurrency),
+        status_update_rate=5,
+        max_size=20,
+    ).launch(**launch_kwargs)
     return 0
 
 

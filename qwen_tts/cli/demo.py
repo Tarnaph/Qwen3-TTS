@@ -699,6 +699,11 @@ Choose the voice source: **Reference Audio** (raw audio) or **Load Voice File** 
                                 value="MP3",
                             )
                             srt_btn = gr.Button("Generate All (批量生成)", variant="primary")
+                            srt_retry_btn = gr.Button(
+                                "🔁 Retry Failed (0)",
+                                variant="secondary",
+                                visible=False,
+                            )
 
                         with gr.Column(scale=3):
                             srt_progress_bar = gr.Slider(
@@ -715,6 +720,10 @@ Choose the voice source: **Reference Audio** (raw audio) or **Load Voice File** 
                                 max_lines=40,
                                 interactive=False,
                             )
+
+                    # State: failed entries [(idx, text)] and full log_lines list
+                    srt_failed_state = gr.State([])
+                    srt_log_state = gr.State([])
 
                     def run_srt_batch(
                         ref_aud, ref_txt: str, use_xvec: bool,
@@ -800,7 +809,8 @@ Choose the voice source: **Reference Audio** (raw audio) or **Load Voice File** 
                                 f"Voice source: {'Voice File (.pt)' if use_prompt_file else 'Reference Audio'}",
                                 f"Found {len(entries)} subtitle(s). Starting generation...\n",
                             ]
-                            yield 0, "\n".join(log_lines)
+                            failed_entries: List[Tuple[int, str]] = []
+                            yield 0, "\n".join(log_lines), failed_entries, log_lines, gr.update(visible=False)
                             total_t0 = time.time()
 
                             for i, (idx, text) in enumerate(entries):
@@ -810,7 +820,7 @@ Choose the voice source: **Reference Audio** (raw audio) or **Load Voice File** 
                                 if len(text.split()) < 2:
                                     log_lines.append(f"⚠️  [{i+1}/{len(entries)}] #{idx} — Skipped (text too short: {repr(text)})")
                                     done_pct = int((i + 1) / len(entries) * 100)
-                                    yield done_pct, "\n".join(log_lines[-40:])
+                                    yield done_pct, "\n".join(log_lines[-40:]), failed_entries, log_lines, gr.update(visible=False)
                                     continue
 
                                 preview_pre = text[:50] + "..." if len(text) > 50 else text
@@ -818,7 +828,7 @@ Choose the voice source: **Reference Audio** (raw audio) or **Load Voice File** 
                                 vram_tag = f" [{vram_info}]" if vram_info else ""
                                 pending_line = f"⏳ [{i+1}/{len(entries)}] #{idx}{vram_tag} — Generating: {preview_pre}"
                                 log_lines.append(pending_line)
-                                yield pct, "\n".join(log_lines[-40:])
+                                yield pct, "\n".join(log_lines[-40:]), failed_entries, log_lines, gr.update(visible=False)
                                 t0 = time.time()
                                 try:
                                     gen_kwargs = dict(
@@ -886,35 +896,180 @@ Choose the voice source: **Reference Audio** (raw audio) or **Load Voice File** 
                                             log_lines.append(f"   ⚠️ ffmpeg error: {ce.stderr.decode(errors='replace')[:200]}")
                                             out_path = wav_path
                                     preview = text[:60] + "..." if len(text) > 60 else text
-                                    # Replace the ⏳ pending line with the ✅ result in-place
                                     log_lines[-1] = f"✅ [{i+1}/{len(entries)}] #{idx} — {elapsed:.1f}s → {out_path}"
                                     log_lines.append(f"   {preview}")
                                 except Exception as e:
                                     log_lines[-1] = f"❌ [{i+1}/{len(entries)}] #{idx} — FAILED: {type(e).__name__}: {e}"
+                                    failed_entries.append((idx, text))
                                 finally:
-                                    # Free VRAM after each generation to prevent OOM accumulation
-                                    # on large SRT batches (60+ entries).
                                     if torch.cuda.is_available():
                                         torch.cuda.empty_cache()
                                     gc.collect()
 
                                 done_pct = int((i + 1) / len(entries) * 100)
-                                # Cap log to last 40 lines to avoid rendering overhead on large batches
-                                yield done_pct, "\n".join(log_lines[-40:])
+                                yield done_pct, "\n".join(log_lines[-40:]), failed_entries, log_lines, gr.update(visible=False)
 
                             total_elapsed = time.time() - total_t0
                             vram_final = _vram_status()
                             vram_suffix = f" | {vram_final}" if vram_final else ""
+                            n_failed = len(failed_entries)
                             log_lines.append(f"\n🏁 Done! {len(entries)} file(s) in {total_elapsed:.1f}s → {out_dir}{vram_suffix}")
-                            yield 100, "\n".join(log_lines[-40:])
+                            if n_failed > 0:
+                                log_lines.append(f"⚠️  {n_failed} entry(ies) failed — click 🔁 to reprocess.")
+                            retry_update = gr.update(visible=n_failed > 0, value=f"🔁 Retry Failed ({n_failed})")
+                            yield 100, "\n".join(log_lines[-40:]), failed_entries, log_lines, retry_update
 
                         except Exception as e:
-                            yield 0, f"❌ {type(e).__name__}: {e}"
+                            yield 0, f"❌ {type(e).__name__}: {e}", [], [], gr.update(visible=False)
+
+                    def run_srt_retry(
+                        failed_entries, log_lines_raw,
+                        ref_aud, ref_txt: str, use_xvec: bool,
+                        prompt_file_obj,
+                        lang_disp: str, instruct: str,
+                        out_dir: str, fmt: str,
+                    ):
+                        import soundfile as sf
+                        import subprocess
+                        import gc
+
+                        if not failed_entries:
+                            yield 0, "\n".join((log_lines_raw or [])[-40:]), [], log_lines_raw or [], gr.update(visible=False)
+                            return
+
+                        log_lines = list(log_lines_raw or [])
+                        n = len(failed_entries)
+                        log_lines.append(f"\n─── 🔁 Retrying {n} failed entry(ies) ───\n")
+                        yield 0, "\n".join(log_lines[-40:]), failed_entries, log_lines, gr.update(visible=False)
+
+                        out_dir = (out_dir or "").strip()
+                        language = lang_map.get(lang_disp, "Auto")
+                        instruct_val = (instruct or "").strip() or None
+                        kwargs = _gen_common_kwargs()
+                        use_prompt_file = prompt_file_obj is not None
+                        voice_items = None
+                        at = None
+
+                        try:
+                            if use_prompt_file:
+                                path = getattr(prompt_file_obj, "name", None) or getattr(prompt_file_obj, "path", None) or str(prompt_file_obj)
+                                payload = torch.load(path, map_location="cpu", weights_only=True)
+                                items_raw = payload.get("items", [])
+                                voice_items: List[VoiceClonePromptItem] = []
+                                for d in items_raw:
+                                    ref_code = d.get("ref_code", None)
+                                    if ref_code is not None and not torch.is_tensor(ref_code):
+                                        ref_code = torch.tensor(ref_code)
+                                    ref_spk = d.get("ref_spk_embedding")
+                                    if not torch.is_tensor(ref_spk):
+                                        ref_spk = torch.tensor(ref_spk)
+                                    voice_items.append(
+                                        VoiceClonePromptItem(
+                                            ref_code=ref_code,
+                                            ref_spk_embedding=ref_spk,
+                                            x_vector_only_mode=bool(d.get("x_vector_only_mode", False)),
+                                            icl_mode=bool(d.get("icl_mode", not bool(d.get("x_vector_only_mode", False)))),
+                                            ref_text=d.get("ref_text", None),
+                                        )
+                                    )
+                            else:
+                                at = _audio_to_tuple(ref_aud)
+
+                            new_failed: List[Tuple[int, str]] = []
+                            total_t0 = time.time()
+
+                            for i, (idx, text) in enumerate(failed_entries):
+                                pct = int(i / n * 100)
+                                preview_pre = text[:50] + "..." if len(text) > 50 else text
+                                vram_info = _vram_status()
+                                vram_tag = f" [{vram_info}]" if vram_info else ""
+                                log_lines.append(f"⏳ [retry {i+1}/{n}] #{idx}{vram_tag} — Generating: {preview_pre}")
+                                yield pct, "\n".join(log_lines[-40:]), new_failed, log_lines, gr.update(visible=False)
+                                t0 = time.time()
+                                try:
+                                    gen_kwargs = dict(text=text, language=language, instruct=instruct_val, **kwargs)
+                                    if use_prompt_file:
+                                        gen_kwargs["voice_clone_prompt"] = voice_items
+                                    else:
+                                        gen_kwargs["ref_audio"] = at
+                                        gen_kwargs["ref_text"] = (ref_txt.strip() if ref_txt else None)
+                                        gen_kwargs["x_vector_only_mode"] = bool(use_xvec)
+                                    word_count = max(len(text.split()), 1)
+                                    gen_kwargs.setdefault("max_new_tokens", min(word_count * 70 + 200, 4096))
+
+                                    _GEN_TIMEOUT = 180
+                                    from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
+
+                                    def _run_generation():
+                                        with torch.no_grad():
+                                            return tts.generate_voice_clone(**gen_kwargs)
+
+                                    with ThreadPoolExecutor(max_workers=1) as _pool:
+                                        _fut = _pool.submit(_run_generation)
+                                        try:
+                                            wavs, sr = _fut.result(timeout=_GEN_TIMEOUT)
+                                        except FuturesTimeout:
+                                            raise RuntimeError(
+                                                f"Generation timed out after {_GEN_TIMEOUT}s — "
+                                                "entry skipped (possible CUDA stall or infinite loop)"
+                                            )
+
+                                    elapsed = time.time() - t0
+                                    ext = (fmt or "MP3").lower()
+                                    wav_path = os.path.join(out_dir, f"{idx:04d}.wav")
+                                    sf.write(wav_path, wavs[0], sr)
+                                    if ext == "wav":
+                                        out_path = wav_path
+                                    else:
+                                        out_path = os.path.join(out_dir, f"{idx:04d}.{ext}")
+                                        try:
+                                            if ext == "mp3":
+                                                cmd = ["ffmpeg", "-y", "-i", wav_path, "-q:a", "2", out_path]
+                                            else:
+                                                cmd = ["ffmpeg", "-y", "-i", wav_path, "-c:a", "aac", "-b:a", "192k", "-vn", out_path]
+                                            subprocess.run(cmd, check=True, capture_output=True)
+                                            os.remove(wav_path)
+                                        except FileNotFoundError:
+                                            log_lines.append(f"   ⚠️ ffmpeg not found — saved as WAV instead")
+                                            out_path = wav_path
+                                        except subprocess.CalledProcessError as ce:
+                                            log_lines.append(f"   ⚠️ ffmpeg error: {ce.stderr.decode(errors='replace')[:200]}")
+                                            out_path = wav_path
+                                    preview = text[:60] + "..." if len(text) > 60 else text
+                                    log_lines[-1] = f"✅ [retry {i+1}/{n}] #{idx} — {elapsed:.1f}s → {out_path}"
+                                    log_lines.append(f"   {preview}")
+                                except Exception as e:
+                                    log_lines[-1] = f"❌ [retry {i+1}/{n}] #{idx} — FAILED: {type(e).__name__}: {e}"
+                                    new_failed.append((idx, text))
+                                finally:
+                                    if torch.cuda.is_available():
+                                        torch.cuda.empty_cache()
+                                    gc.collect()
+
+                                done_pct = int((i + 1) / n * 100)
+                                yield done_pct, "\n".join(log_lines[-40:]), new_failed, log_lines, gr.update(visible=False)
+
+                            total_elapsed = time.time() - total_t0
+                            n_failed = len(new_failed)
+                            log_lines.append(f"\n🏁 Retry done! {n - n_failed}/{n} recovered in {total_elapsed:.1f}s")
+                            if n_failed > 0:
+                                log_lines.append(f"⚠️  {n_failed} entry(ies) still failing.")
+                            retry_update = gr.update(visible=n_failed > 0, value=f"🔁 Retry Failed ({n_failed})")
+                            yield 100, "\n".join(log_lines[-40:]), new_failed, log_lines, retry_update
+
+                        except Exception as e:
+                            log_lines.append(f"\n❌ Retry error: {type(e).__name__}: {e}")
+                            yield 0, "\n".join(log_lines[-40:]), failed_entries, log_lines, gr.update(visible=True, value=f"🔁 Retry Failed ({len(failed_entries)})")
 
                     srt_btn.click(
                         run_srt_batch,
                         inputs=[srt_ref_audio, srt_ref_text, srt_xvec_only, srt_prompt_file, srt_lang, srt_instruct, srt_file, srt_out_dir, srt_format],
-                        outputs=[srt_progress_bar, srt_status],
+                        outputs=[srt_progress_bar, srt_status, srt_failed_state, srt_log_state, srt_retry_btn],
+                    )
+                    srt_retry_btn.click(
+                        run_srt_retry,
+                        inputs=[srt_failed_state, srt_log_state, srt_ref_audio, srt_ref_text, srt_xvec_only, srt_prompt_file, srt_lang, srt_instruct, srt_out_dir, srt_format],
+                        outputs=[srt_progress_bar, srt_status, srt_failed_state, srt_log_state, srt_retry_btn],
                     )
 
                 with gr.Tab("🎨 Voice Design"):

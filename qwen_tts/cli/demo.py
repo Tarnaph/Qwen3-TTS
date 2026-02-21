@@ -745,6 +745,11 @@ Choose the voice source: **Reference Audio** (raw audio) or **Load Voice File** 
                                     value=[],
                                 )
 
+                            srt_auto_retry = gr.Checkbox(
+                                label="🔄 Auto-retry on failure",
+                                value=False,
+                                info="If enabled, failed entries are automatically retried after the batch finishes (until no new successes).",
+                            )
                             srt_btn = gr.Button("Generate (批量生成)", variant="primary")
                             srt_retry_btn = gr.Button(
                                 "🔁 Retry Failed (0)",
@@ -816,6 +821,7 @@ Choose the voice source: **Reference Audio** (raw audio) or **Load Voice File** 
                         lang_disp: str, instruct: str,
                         srt_file_obj, out_dir: str, fmt: str,
                         block_size, selected_blocks,
+                        auto_retry: bool,
                     ):
                         import soundfile as sf
                         import subprocess
@@ -1026,7 +1032,92 @@ Choose the voice source: **Reference Audio** (raw audio) or **Load Voice File** 
                             n_failed = len(failed_entries)
                             log_lines.append(f"\n🏁 Done! {len(entries)} file(s) in {total_elapsed:.1f}s → {out_dir}{vram_suffix}")
                             if n_failed > 0:
-                                log_lines.append(f"⚠️  {n_failed} entry(ies) failed — click 🔁 to reprocess.")
+                                if auto_retry:
+                                    log_lines.append(f"⚠️  {n_failed} entry(ies) failed — 🔄 Auto-retry enabled, retrying now...")
+                                else:
+                                    log_lines.append(f"⚠️  {n_failed} entry(ies) failed — click 🔁 to reprocess.")
+
+                            # --- Auto-retry loop ---
+                            retry_round = 0
+                            while auto_retry and failed_entries:
+                                retry_round += 1
+                                prev_failed_count = len(failed_entries)
+                                to_retry = list(failed_entries)
+                                failed_entries = []
+                                log_lines.append(f"\n─── 🔄 Auto-retry round {retry_round}: {len(to_retry)} entr(ies) ───\n")
+                                yield 0, "\n".join(log_lines[-40:]), failed_entries, log_lines, gr.update(visible=False)
+
+                                for i, (idx, text) in enumerate(to_retry):
+                                    pct = int(i / len(to_retry) * 100)
+                                    preview_pre = text[:80] + "..." if len(text) > 80 else text
+                                    vram_info = _vram_status()
+                                    vram_tag = f" [{vram_info}]" if vram_info else ""
+                                    log_lines.append(f"⏳ [retry-{retry_round} {i+1}/{len(to_retry)}] #{idx}{vram_tag} — {preview_pre}")
+                                    yield pct, "\n".join(log_lines[-40:]), failed_entries, log_lines, gr.update(visible=False)
+                                    t0 = time.time()
+                                    try:
+                                        gen_kwargs = dict(text=text, language=language, instruct=instruct_val, **kwargs)
+                                        if use_prompt_file:
+                                            gen_kwargs["voice_clone_prompt"] = voice_items
+                                        else:
+                                            gen_kwargs["ref_audio"] = at
+                                            gen_kwargs["ref_text"] = (ref_txt.strip() if ref_txt else None)
+                                            gen_kwargs["x_vector_only_mode"] = bool(use_xvec)
+                                        char_count = max(len(text), 1)
+                                        gen_kwargs["max_new_tokens"] = min(char_count * 12 + 300, 8192)
+
+                                        _GEN_TIMEOUT = 180
+                                        from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
+
+                                        def _run_gen_retry():
+                                            with torch.no_grad():
+                                                return tts.generate_voice_clone(**gen_kwargs)
+
+                                        with ThreadPoolExecutor(max_workers=1) as _pool:
+                                            _fut = _pool.submit(_run_gen_retry)
+                                            try:
+                                                wavs, sr = _fut.result(timeout=_GEN_TIMEOUT)
+                                            except FuturesTimeout:
+                                                raise RuntimeError(f"Timed out after {_GEN_TIMEOUT}s")
+
+                                        elapsed = time.time() - t0
+                                        ext = (fmt or "MP3").lower()
+                                        wav_path = os.path.join(out_dir, f"{idx:04d}.wav")
+                                        sf.write(wav_path, wavs[0], sr)
+                                        if ext == "wav":
+                                            out_path = wav_path
+                                        else:
+                                            out_path = os.path.join(out_dir, f"{idx:04d}.{ext}")
+                                            try:
+                                                if ext == "mp3":
+                                                    cmd = ["ffmpeg", "-y", "-i", wav_path, "-q:a", "2", out_path]
+                                                else:
+                                                    cmd = ["ffmpeg", "-y", "-i", wav_path, "-c:a", "aac", "-b:a", "192k", "-vn", out_path]
+                                                subprocess.run(cmd, check=True, capture_output=True)
+                                                os.remove(wav_path)
+                                            except (FileNotFoundError, subprocess.CalledProcessError):
+                                                out_path = wav_path
+                                        log_lines[-1] = f"✅ [retry-{retry_round} {i+1}/{len(to_retry)}] #{idx} — {elapsed:.1f}s → {out_path}"
+                                        log_lines.append(f"   {text[:60]}{'...' if len(text) > 60 else ''}")
+                                    except Exception as e:
+                                        log_lines[-1] = f"❌ [retry-{retry_round} {i+1}/{len(to_retry)}] #{idx} — {type(e).__name__}: {e}"
+                                        failed_entries.append((idx, text))
+                                    finally:
+                                        if torch.cuda.is_available():
+                                            torch.cuda.empty_cache()
+                                        gc.collect()
+
+                                    done_pct = int((i + 1) / len(to_retry) * 100)
+                                    yield done_pct, "\n".join(log_lines[-40:]), failed_entries, log_lines, gr.update(visible=False)
+
+                                # If no improvement, stop to avoid infinite loop
+                                if len(failed_entries) >= prev_failed_count:
+                                    log_lines.append(f"\n⚠️ Auto-retry round {retry_round}: no improvement — stopping.")
+                                    break
+                                if failed_entries:
+                                    log_lines.append(f"✅ Round {retry_round} recovered {prev_failed_count - len(failed_entries)}, {len(failed_entries)} still failing.")
+
+                            n_failed = len(failed_entries)
                             retry_update = gr.update(visible=n_failed > 0, value=f"🔁 Retry Failed ({n_failed})")
                             yield 100, "\n".join(log_lines[-40:]), failed_entries, log_lines, retry_update
 
@@ -1179,6 +1270,7 @@ Choose the voice source: **Reference Audio** (raw audio) or **Load Voice File** 
                             srt_lang, srt_instruct,
                             srt_file, srt_out_dir, srt_format,
                             srt_block_size, srt_blocks_sel,
+                            srt_auto_retry,
                         ],
                         outputs=[srt_progress_bar, srt_status, srt_failed_state, srt_log_state, srt_retry_btn],
                     )

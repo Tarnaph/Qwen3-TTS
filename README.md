@@ -31,6 +31,11 @@ Esta versão inclui melhorias na interface web (`demo.py`) em relação ao origi
 | **Load Voice no SRT Batch** | Suporte a arquivo `.pt` de voz salva como fonte alternativa ao áudio de referência raw |
 | **Barra de progresso** | Progresso em tempo real (`⏳ Generating...` → `✅ Done`) durante geração em lote |
 | **ffmpeg export** | Conversão automática para MP3 e MP4 via ffmpeg após geração |
+| **Voice Blend** | Nova aba: combina embeddings de duas vozes com slider de ratio para criar voz híbrida; exporta `.pt` |
+| **🔁 Retry Failed** | Botão para reprocessar apenas as legendas que falharam no batch, com log cumulativo |
+| **Fix SRT parser** | Parser robusto: trata BOM UTF-8, CRLF do Windows e usa regex para identificar o timecode com segurança, evitando descartar texto válido |
+| **Fix áudio truncado** | `max_new_tokens` calculado por caracteres (`char_count × 12 + 300`) em vez de palavras; cap elevado de 4096 → 8192 para garantir que legendas longas não sejam cortadas |
+| **Log texto completo** | O log exibe o texto integral de cada legenda (>80 chars) para que seja possível verificar o parsing durante o batch |
 
 ---
 

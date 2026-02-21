@@ -245,21 +245,45 @@ def _wav_to_gradio_audio(wav: np.ndarray, sr: int) -> Tuple[int, np.ndarray]:
 
 
 def _parse_srt(content: str) -> List[Tuple[int, str]]:
-    """Parse SRT content and return list of (index, text) tuples."""
+    """Parse SRT content and return list of (index, text) tuples.
+
+    Handles:
+    - UTF-8 BOM (\ufeff) at file start
+    - Windows CRLF line endings
+    - SRT HTML tags (<i>, <b>, <font color=...>)
+    - Malformed blocks where timecode regex fails
+    """
     import re
+    # Strip BOM and normalise line endings
+    content = content.lstrip("\ufeff").replace("\r\n", "\n").replace("\r", "\n")
     entries = []
-    blocks = re.split(r"\n\s*\n", content.strip())
+    # Split on blank lines (one or more)
+    blocks = re.split(r"\n{2,}", content.strip())
+    _timecode_re = re.compile(
+        r"^\d{1,2}:\d{2}:\d{2}[,.]\d{1,3}\s*-->\s*\d{1,2}:\d{2}:\d{2}[,.]\d{1,3}"
+    )
     for block in blocks:
-        lines = block.strip().splitlines()
-        if len(lines) < 3:
+        lines = [ln for ln in block.strip().splitlines() if ln.strip()]
+        if len(lines) < 2:
             continue
+        # Line 0 should be the numeric index
         try:
             idx = int(lines[0].strip())
         except ValueError:
             continue
-        # skip the timecode line (lines[1]), join remaining as text
-        raw = " ".join(line.strip() for line in lines[2:] if line.strip())
-        # Strip HTML tags that SRT files sometimes contain (e.g. <i>, <b>, <font color=...>)
+        # Find the timecode line (usually lines[1] but search robustly)
+        tc_idx = None
+        for li, ln in enumerate(lines[1:], start=1):
+            if _timecode_re.match(ln.strip()):
+                tc_idx = li
+                break
+        if tc_idx is None:
+            # No timecode found — skip this block
+            continue
+        # Everything after the timecode line is subtitle text
+        text_lines = lines[tc_idx + 1 :]
+        raw = " ".join(ln.strip() for ln in text_lines if ln.strip())
+        # Strip HTML tags that SRT files sometimes contain
         text = re.sub(r"<[^>]+>", "", raw).strip()
         if text:
             entries.append((idx, text))
@@ -823,11 +847,14 @@ Choose the voice source: **Reference Audio** (raw audio) or **Load Voice File** 
                                     yield done_pct, "\n".join(log_lines[-40:]), failed_entries, log_lines, gr.update(visible=False)
                                     continue
 
-                                preview_pre = text[:50] + "..." if len(text) > 50 else text
+                                preview_pre = text[:80] + "..." if len(text) > 80 else text
                                 vram_info = _vram_status()
                                 vram_tag = f" [{vram_info}]" if vram_info else ""
                                 pending_line = f"⏳ [{i+1}/{len(entries)}] #{idx}{vram_tag} — Generating: {preview_pre}"
                                 log_lines.append(pending_line)
+                                # Show full text in log so user can verify correct parsing
+                                if len(text) > 80:
+                                    log_lines.append(f"   Full text ({len(text)} chars): {text}")
                                 yield pct, "\n".join(log_lines[-40:]), failed_entries, log_lines, gr.update(visible=False)
                                 t0 = time.time()
                                 try:
@@ -845,11 +872,13 @@ Choose the voice source: **Reference Audio** (raw audio) or **Load Voice File** 
                                         gen_kwargs["x_vector_only_mode"] = bool(use_xvec)
 
                                     # [Option B] Dynamic max_new_tokens: cap based on text length.
-                                    # ~70 audio tokens per word is a safe upper bound for Qwen3-TTS.
-                                    # Prevents infinite generation loops on edge-case texts.
+                                    # Use character count (more reliable than word count for
+                                    # punctuation-heavy or non-Latin text).
+                                    # ~12 audio tokens per character is a safe upper bound.
+                                    # Cap raised to 8192 to avoid truncating longer subtitle lines.
                                     if "max_new_tokens" not in gen_kwargs or gen_kwargs.get("max_new_tokens") is None:
-                                        word_count = max(len(text.split()), 1)
-                                        gen_kwargs["max_new_tokens"] = min(word_count * 70 + 200, 4096)
+                                        char_count = max(len(text), 1)
+                                        gen_kwargs["max_new_tokens"] = min(char_count * 12 + 300, 8192)
 
                                     # [Option A] Run generation in a thread with a hard timeout.
                                     # If the model hangs (OOM deadlock, infinite loop, CUDA stall),
@@ -994,8 +1023,8 @@ Choose the voice source: **Reference Audio** (raw audio) or **Load Voice File** 
                                         gen_kwargs["ref_audio"] = at
                                         gen_kwargs["ref_text"] = (ref_txt.strip() if ref_txt else None)
                                         gen_kwargs["x_vector_only_mode"] = bool(use_xvec)
-                                    word_count = max(len(text.split()), 1)
-                                    gen_kwargs.setdefault("max_new_tokens", min(word_count * 70 + 200, 4096))
+                                    char_count = max(len(text), 1)
+                                    gen_kwargs.setdefault("max_new_tokens", min(char_count * 12 + 300, 8192))
 
                                     _GEN_TIMEOUT = 180
                                     from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout

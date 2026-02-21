@@ -18,6 +18,7 @@ A gradio demo for Qwen3 TTS models.
 """
 
 import argparse
+import math
 import time
 import os
 import tempfile
@@ -722,7 +723,29 @@ Choose the voice source: **Reference Audio** (raw audio) or **Load Voice File** 
                                 choices=["WAV", "MP3", "MP4"],
                                 value="MP3",
                             )
-                            srt_btn = gr.Button("Generate All (批量生成)", variant="primary")
+
+                            # --- Block selection ---
+                            with gr.Accordion("🧩 Block Generation (geração por blocos)", open=False):
+                                gr.Markdown(
+                                    "Divide the SRT into blocks of N entries. Select which blocks to generate. "
+                                    "**Leave all unchecked to generate everything** (default)."
+                                )
+                                srt_block_size = gr.Number(
+                                    label="Entries per block (legendas por bloco)",
+                                    value=10,
+                                    minimum=1,
+                                    step=1,
+                                    precision=0,
+                                    info="Change this after uploading the SRT to recalculate blocks.",
+                                )
+                                srt_block_info = gr.Markdown("📂 Upload an SRT file to see available blocks.")
+                                srt_blocks_sel = gr.CheckboxGroup(
+                                    label="Blocks to generate (leave empty = ALL)",
+                                    choices=[],
+                                    value=[],
+                                )
+
+                            srt_btn = gr.Button("Generate (批量生成)", variant="primary")
                             srt_retry_btn = gr.Button(
                                 "🔁 Retry Failed (0)",
                                 variant="secondary",
@@ -749,11 +772,50 @@ Choose the voice source: **Reference Audio** (raw audio) or **Load Voice File** 
                     srt_failed_state = gr.State([])
                     srt_log_state = gr.State([])
 
+                    # --- Block preview: updates CheckboxGroup when SRT or block size changes ---
+                    def _update_blocks(srt_file_obj, block_size):
+                        """Parse SRT and return block choices for the CheckboxGroup."""
+                        if srt_file_obj is None:
+                            return (
+                                gr.update(choices=[], value=[]),
+                                "📂 Upload an SRT file to see available blocks.",
+                            )
+                        try:
+                            srt_path = getattr(srt_file_obj, "name", None) or str(srt_file_obj)
+                            with open(srt_path, "r", encoding="utf-8", errors="replace") as _f:
+                                _content = _f.read()
+                            all_entries = _parse_srt(_content)
+                            n = max(int(block_size or 10), 1)
+                            num_blocks = math.ceil(len(all_entries) / n) if all_entries else 0
+                            choices = [
+                                f"Bloco {i + 1}  (#{all_entries[i * n][0]} – #{all_entries[min((i + 1) * n, len(all_entries)) - 1][0]})"
+                                for i in range(num_blocks)
+                            ]
+                            info = (
+                                f"**{len(all_entries)} legendas → {num_blocks} bloco(s) de {n}** "
+                                f"{'(último bloco menor)' if len(all_entries) % n else ''}"
+                            )
+                            return gr.update(choices=choices, value=[]), info
+                        except Exception as _e:
+                            return gr.update(choices=[], value=[]), f"⚠️ Erro ao ler SRT: {_e}"
+
+                    srt_file.change(
+                        _update_blocks,
+                        inputs=[srt_file, srt_block_size],
+                        outputs=[srt_blocks_sel, srt_block_info],
+                    )
+                    srt_block_size.change(
+                        _update_blocks,
+                        inputs=[srt_file, srt_block_size],
+                        outputs=[srt_blocks_sel, srt_block_info],
+                    )
+
                     def run_srt_batch(
                         ref_aud, ref_txt: str, use_xvec: bool,
                         prompt_file_obj,
                         lang_disp: str, instruct: str,
                         srt_file_obj, out_dir: str, fmt: str,
+                        block_size, selected_blocks,
                     ):
                         import soundfile as sf
                         import subprocess
@@ -778,6 +840,21 @@ Choose the voice source: **Reference Audio** (raw audio) or **Load Voice File** 
                             if not entries:
                                 yield 0, "❌ No subtitle entries found in SRT file."
                                 return
+
+                            # --- Filter by selected blocks ---
+                            block_sz = max(int(block_size or 10), 1)
+                            if selected_blocks:
+                                selected_block_idxs: set = set()
+                                for label in selected_blocks:
+                                    # label format: "Bloco 2  (#11 – #20)"
+                                    b = int(label.split()[1]) - 1
+                                    selected_block_idxs.update(
+                                        range(b * block_sz, min((b + 1) * block_sz, len(entries)))
+                                    )
+                                entries = [e for i, e in enumerate(entries) if i in selected_block_idxs]
+                                if not entries:
+                                    yield 0, "❌ Selected blocks produced no entries."
+                                    return
 
                             language = lang_map.get(lang_disp, "Auto")
                             instruct_val = (instruct or "").strip() or None
@@ -831,8 +908,13 @@ Choose the voice source: **Reference Audio** (raw audio) or **Load Voice File** 
 
                             log_lines = [
                                 f"Voice source: {'Voice File (.pt)' if use_prompt_file else 'Reference Audio'}",
-                                f"Found {len(entries)} subtitle(s). Starting generation...\n",
                             ]
+                            if selected_blocks:
+                                log_lines.append(
+                                    f"🧩 Block filter: {', '.join(selected_blocks)} "
+                                    f"→ {len(entries)} subtitle(s) selected."
+                                )
+                            log_lines.append(f"Found {len(entries)} subtitle(s). Starting generation...\n")
                             failed_entries: List[Tuple[int, str]] = []
                             yield 0, "\n".join(log_lines), failed_entries, log_lines, gr.update(visible=False)
                             total_t0 = time.time()
@@ -1092,7 +1174,12 @@ Choose the voice source: **Reference Audio** (raw audio) or **Load Voice File** 
 
                     srt_btn.click(
                         run_srt_batch,
-                        inputs=[srt_ref_audio, srt_ref_text, srt_xvec_only, srt_prompt_file, srt_lang, srt_instruct, srt_file, srt_out_dir, srt_format],
+                        inputs=[
+                            srt_ref_audio, srt_ref_text, srt_xvec_only, srt_prompt_file,
+                            srt_lang, srt_instruct,
+                            srt_file, srt_out_dir, srt_format,
+                            srt_block_size, srt_blocks_sel,
+                        ],
                         outputs=[srt_progress_bar, srt_status, srt_failed_state, srt_log_state, srt_retry_btn],
                     )
                     srt_retry_btn.click(

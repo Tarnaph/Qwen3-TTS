@@ -761,8 +761,8 @@ Choose the voice source: **Reference Audio** (raw audio) or **Load Voice File** 
                                 variant="secondary",
                                 visible=False,
                             )
-                            # Hidden button for chaining the blocks
-                            srt_next_trigger = gr.Button("Hidden Next Trigger", visible=False)
+                            # Hidden component for chaining the blocks
+                            srt_next_trigger = gr.Textbox(value="", visible=False)
 
                         with gr.Column(scale=3):
                             srt_progress_bar = gr.Slider(
@@ -1291,6 +1291,11 @@ Choose the voice source: **Reference Audio** (raw audio) or **Load Voice File** 
 
                     # Step 1: When user clicks "Generate", it starts the first block
                     # The generator returns the updated state as the final tuple element.
+                    def _run_srt_batch_chained(trigger_val, *args):
+                        if not trigger_val:
+                            return
+                        yield from run_srt_batch(*args, is_chain_triggered=True)
+
                     srt_btn.click(
                         run_srt_batch,
                         inputs=[
@@ -1302,38 +1307,35 @@ Choose the voice source: **Reference Audio** (raw audio) or **Load Voice File** 
                         ],
                         outputs=[srt_progress_bar, srt_status, srt_failed_state, srt_log_state, srt_pending_blocks_state],
                     ).then(
-                        lambda pending, auto_next: gr.update(visible=bool(pending and auto_next)),
+                        lambda pending, auto_next: str(time.time()) if pending and auto_next else "",
                         inputs=[srt_pending_blocks_state, srt_auto_next],
                         outputs=[srt_next_trigger]
                     ).then(
-                        lambda n_failed: gr.update(visible=n_failed > 0, value=f"🔁 Retry Failed ({n_failed})"),
-                        inputs=[lambda f: len(f) if f else 0],
+                        lambda f: gr.update(visible=len(f) > 0, value=f"🔁 Retry Failed ({len(f)})") if f else gr.update(visible=False, value="🔁 Retry Failed (0)"),
+                        inputs=[srt_failed_state],
                         outputs=[srt_retry_btn]
                     )
 
                     # Step 2: Hidden trigger for next blocks
-                    # Is clicked virtually if the visibility becomes true (which means there are pending blocks and auto_next is True)
+                    # Is triggered dynamically by changing to a new time value
                     srt_next_trigger.change(
-                        lambda is_vis: None if not is_vis else True, # return a dummy to trigger the chain
-                        inputs=[srt_next_trigger], outputs=[]
-                    ).then(
-                        # We pass `is_chain_triggered=True` via lambda: True
-                        run_srt_batch,
+                        _run_srt_batch_chained,
                         inputs=[
+                            srt_next_trigger,
                             srt_ref_audio, srt_ref_text, srt_xvec_only, srt_prompt_file,
                             srt_lang, srt_instruct,
                             srt_file, srt_out_dir, srt_format,
                             srt_block_size, srt_blocks_sel,
-                            srt_auto_retry, srt_auto_next, srt_pending_blocks_state, srt_log_state, gr.State(True)
+                            srt_auto_retry, srt_auto_next, srt_pending_blocks_state, srt_log_state
                         ],
                         outputs=[srt_progress_bar, srt_status, srt_failed_state, srt_log_state, srt_pending_blocks_state],
                     ).then(
-                        lambda pending, auto_next: gr.update(visible=bool(pending and auto_next)),
+                        lambda pending, auto_next: str(time.time()) if pending and auto_next else "",
                         inputs=[srt_pending_blocks_state, srt_auto_next],
                         outputs=[srt_next_trigger]
                     ).then(
-                        lambda n_failed: gr.update(visible=n_failed > 0, value=f"🔁 Retry Failed ({n_failed})"),
-                        inputs=[lambda f: len(f) if f else 0],
+                        lambda f: gr.update(visible=len(f) > 0, value=f"🔁 Retry Failed ({len(f)})") if f else gr.update(visible=False, value="🔁 Retry Failed (0)"),
+                        inputs=[srt_failed_state],
                         outputs=[srt_retry_btn]
                     )
 

@@ -750,12 +750,19 @@ Choose the voice source: **Reference Audio** (raw audio) or **Load Voice File** 
                                 value=False,
                                 info="If enabled, failed entries are automatically retried after the batch finishes (until no new successes).",
                             )
+                            srt_auto_next = gr.Checkbox(
+                                label="⏭️ Auto-start next block",
+                                value=False,
+                                info="If enabled, automatically continues to the next block after this one finishes without needing to click.",
+                            )
                             srt_btn = gr.Button("Generate (批量生成)", variant="primary")
                             srt_retry_btn = gr.Button(
                                 "🔁 Retry Failed (0)",
                                 variant="secondary",
                                 visible=False,
                             )
+                            # Hidden button for chaining the blocks
+                            srt_next_trigger = gr.Button("Hidden Next Trigger", visible=False)
 
                         with gr.Column(scale=3):
                             srt_progress_bar = gr.Slider(
@@ -773,9 +780,10 @@ Choose the voice source: **Reference Audio** (raw audio) or **Load Voice File** 
                                 interactive=False,
                             )
 
-                    # State: failed entries [(idx, text)] and full log_lines list
+                    # State: failed entries [(idx, text)], full log_lines list, and pending blocks list
                     srt_failed_state = gr.State([])
                     srt_log_state = gr.State([])
+                    srt_pending_blocks_state = gr.State([])
 
                     # --- Block preview: updates CheckboxGroup when SRT or block size changes ---
                     def _update_blocks(srt_file_obj, block_size):
@@ -821,7 +829,7 @@ Choose the voice source: **Reference Audio** (raw audio) or **Load Voice File** 
                         lang_disp: str, instruct: str,
                         srt_file_obj, out_dir: str, fmt: str,
                         block_size, selected_blocks,
-                        auto_retry: bool,
+                        auto_retry: bool, auto_next: bool, pending_blocks_state, log_lines_state, is_chain_triggered=False
                     ):
                         import soundfile as sf
                         import subprocess
@@ -829,10 +837,10 @@ Choose the voice source: **Reference Audio** (raw audio) or **Load Voice File** 
 
                         try:
                             if srt_file_obj is None:
-                                yield 0, "❌ SRT file is required (必须上传字幕文件)."
+                                yield 0, "❌ SRT file is required (必须上传字幕文件).", [], [], []
                                 return
                             if not out_dir or not out_dir.strip():
-                                yield 0, "❌ Output folder is required (必须填写输出文件夹路径)."
+                                yield 0, "❌ Output folder is required (必须填写输出文件夹路径).", [], [], []
                                 return
 
                             out_dir = out_dir.strip()
@@ -844,23 +852,37 @@ Choose the voice source: **Reference Audio** (raw audio) or **Load Voice File** 
 
                             entries = _parse_srt(srt_content)
                             if not entries:
-                                yield 0, "❌ No subtitle entries found in SRT file."
+                                yield 0, "❌ No subtitle entries found in SRT file.", [], [], []
                                 return
 
                             # --- Filter by selected blocks ---
                             block_sz = max(int(block_size or 10), 1)
-                            if selected_blocks:
-                                selected_block_idxs: set = set()
-                                for label in selected_blocks:
-                                    # label format: "Bloco 2  (#11 – #20)"
-                                    b = int(label.split()[1]) - 1
-                                    selected_block_idxs.update(
-                                        range(b * block_sz, min((b + 1) * block_sz, len(entries)))
-                                    )
+                            blocks_to_run = selected_blocks or []
+                            
+                            if is_chain_triggered:
+                                # We are continuing from a previous chain. Use pending
+                                blocks_to_run = pending_blocks_state
+                            else:
+                                # If all blocks are unselected, that means run ALL blocks, 
+                                # but for the auto-next logic to work, we need an explicit list of block labels.
+                                if not blocks_to_run:
+                                    num_blocks = math.ceil(len(entries) / block_sz) if entries else 0
+                                    blocks_to_run = [
+                                        f"Bloco {i + 1}  (#{entries[i * block_sz][0]} – #{entries[min((i + 1) * block_sz, len(entries)) - 1][0]})"
+                                        for i in range(num_blocks)
+                                    ]
+
+                            current_block_label = blocks_to_run[0] if blocks_to_run else None
+                            new_pending_blocks = blocks_to_run[1:] if len(blocks_to_run) > 1 else []
+
+                            if current_block_label:
+                                b = int(current_block_label.split()[1]) - 1
+                                selected_block_idxs = set(range(b * block_sz, min((b + 1) * block_sz, len(entries))))
                                 entries = [e for i, e in enumerate(entries) if i in selected_block_idxs]
-                                if not entries:
-                                    yield 0, "❌ Selected blocks produced no entries."
-                                    return
+                            
+                            if not entries:
+                                yield 0, "❌ Block parsing error: produced no entries.", [], [], []
+                                return
 
                             language = lang_map.get(lang_disp, "Auto")
                             instruct_val = (instruct or "").strip() or None
@@ -890,7 +912,7 @@ Choose the voice source: **Reference Audio** (raw audio) or **Load Voice File** 
                                         ref_code = torch.tensor(ref_code)
                                     ref_spk = d.get("ref_spk_embedding", None)
                                     if ref_spk is None:
-                                        yield 0, "❌ Missing ref_spk_embedding (缺少说话人向量)."
+                                        yield 0, "❌ Missing ref_spk_embedding (缺少说话人向量).", [], [], []
                                         return
                                     if not torch.is_tensor(ref_spk):
                                         ref_spk = torch.tensor(ref_spk)
@@ -904,25 +926,30 @@ Choose the voice source: **Reference Audio** (raw audio) or **Load Voice File** 
                                         )
                                     )
                             else:
-                                at = _audio_to_tuple(ref_aud)
                                 if at is None:
-                                    yield 0, "❌ Reference audio or Voice File is required (必须上传参考音频或音色文件)."
+                                    yield 0, "❌ Reference audio or Voice File is required (必须上传参考音频或音色文件).", [], [], []
                                     return
                                 if (not use_xvec) and (not ref_txt or not ref_txt.strip()):
-                                    yield 0, "❌ Reference text is required when x-vector only is NOT enabled."
+                                    yield 0, "❌ Reference text is required when x-vector only is NOT enabled.", [], [], []
                                     return
 
-                            log_lines = [
-                                f"Voice source: {'Voice File (.pt)' if use_prompt_file else 'Reference Audio'}",
-                            ]
-                            if selected_blocks:
+                            
+                            log_lines = list(log_lines_state) if is_chain_triggered else []
+                            if not is_chain_triggered:
+                                log_lines.extend([
+                                    f"Voice source: {'Voice File (.pt)' if use_prompt_file else 'Reference Audio'}",
+                                ])
+                            
+                            if current_block_label:
                                 log_lines.append(
-                                    f"🧩 Block filter: {', '.join(selected_blocks)} "
-                                    f"→ {len(entries)} subtitle(s) selected."
+                                    f"\n▶️ Starting {current_block_label} "
+                                    f"({len(entries)} subtitle(s))"
                                 )
-                            log_lines.append(f"Found {len(entries)} subtitle(s). Starting generation...\n")
+                                if new_pending_blocks:
+                                    log_lines.append(f"   (Queue: {len(new_pending_blocks)} block(s) pending after this)")
+
                             failed_entries: List[Tuple[int, str]] = []
-                            yield 0, "\n".join(log_lines), failed_entries, log_lines, gr.update(visible=False)
+                            yield 0, "\n".join(log_lines), failed_entries, log_lines, new_pending_blocks
                             total_t0 = time.time()
 
                             for i, (idx, text) in enumerate(entries):
@@ -932,7 +959,7 @@ Choose the voice source: **Reference Audio** (raw audio) or **Load Voice File** 
                                 if len(text.split()) < 2:
                                     log_lines.append(f"⚠️  [{i+1}/{len(entries)}] #{idx} — Skipped (text too short: {repr(text)})")
                                     done_pct = int((i + 1) / len(entries) * 100)
-                                    yield done_pct, "\n".join(log_lines[-40:]), failed_entries, log_lines, gr.update(visible=False)
+                                    yield done_pct, "\n".join(log_lines[-40:]), failed_entries, log_lines, new_pending_blocks
                                     continue
 
                                 preview_pre = text[:80] + "..." if len(text) > 80 else text
@@ -943,7 +970,7 @@ Choose the voice source: **Reference Audio** (raw audio) or **Load Voice File** 
                                 # Show full text in log so user can verify correct parsing
                                 if len(text) > 80:
                                     log_lines.append(f"   Full text ({len(text)} chars): {text}")
-                                yield pct, "\n".join(log_lines[-40:]), failed_entries, log_lines, gr.update(visible=False)
+                                yield pct, "\n".join(log_lines[-40:]), failed_entries, log_lines, new_pending_blocks
                                 t0 = time.time()
                                 try:
                                     gen_kwargs = dict(
@@ -1024,7 +1051,7 @@ Choose the voice source: **Reference Audio** (raw audio) or **Load Voice File** 
                                     gc.collect()
 
                                 done_pct = int((i + 1) / len(entries) * 100)
-                                yield done_pct, "\n".join(log_lines[-40:]), failed_entries, log_lines, gr.update(visible=False)
+                                yield done_pct, "\n".join(log_lines[-40:]), failed_entries, log_lines, new_pending_blocks
 
                             total_elapsed = time.time() - total_t0
                             vram_final = _vram_status()
@@ -1045,7 +1072,7 @@ Choose the voice source: **Reference Audio** (raw audio) or **Load Voice File** 
                                 to_retry = list(failed_entries)
                                 failed_entries = []
                                 log_lines.append(f"\n─── 🔄 Auto-retry round {retry_round}: {len(to_retry)} entr(ies) ───\n")
-                                yield 0, "\n".join(log_lines[-40:]), failed_entries, log_lines, gr.update(visible=False)
+                                yield 0, "\n".join(log_lines[-40:]), failed_entries, log_lines, new_pending_blocks
 
                                 for i, (idx, text) in enumerate(to_retry):
                                     pct = int(i / len(to_retry) * 100)
@@ -1053,7 +1080,7 @@ Choose the voice source: **Reference Audio** (raw audio) or **Load Voice File** 
                                     vram_info = _vram_status()
                                     vram_tag = f" [{vram_info}]" if vram_info else ""
                                     log_lines.append(f"⏳ [retry-{retry_round} {i+1}/{len(to_retry)}] #{idx}{vram_tag} — {preview_pre}")
-                                    yield pct, "\n".join(log_lines[-40:]), failed_entries, log_lines, gr.update(visible=False)
+                                    yield pct, "\n".join(log_lines[-40:]), failed_entries, log_lines, new_pending_blocks
                                     t0 = time.time()
                                     try:
                                         gen_kwargs = dict(text=text, language=language, instruct=instruct_val, **kwargs)
@@ -1108,7 +1135,7 @@ Choose the voice source: **Reference Audio** (raw audio) or **Load Voice File** 
                                         gc.collect()
 
                                     done_pct = int((i + 1) / len(to_retry) * 100)
-                                    yield done_pct, "\n".join(log_lines[-40:]), failed_entries, log_lines, gr.update(visible=False)
+                                    yield done_pct, "\n".join(log_lines[-40:]), failed_entries, log_lines, new_pending_blocks
 
                                 # If no improvement, stop to avoid infinite loop
                                 if len(failed_entries) >= prev_failed_count:
@@ -1118,11 +1145,10 @@ Choose the voice source: **Reference Audio** (raw audio) or **Load Voice File** 
                                     log_lines.append(f"✅ Round {retry_round} recovered {prev_failed_count - len(failed_entries)}, {len(failed_entries)} still failing.")
 
                             n_failed = len(failed_entries)
-                            retry_update = gr.update(visible=n_failed > 0, value=f"🔁 Retry Failed ({n_failed})")
-                            yield 100, "\n".join(log_lines[-40:]), failed_entries, log_lines, retry_update
+                            yield 100, "\n".join(log_lines[-40:]), failed_entries, log_lines, new_pending_blocks
 
                         except Exception as e:
-                            yield 0, f"❌ {type(e).__name__}: {e}", [], [], gr.update(visible=False)
+                            yield 0, f"❌ {type(e).__name__}: {e}", [], [], []
 
                     def run_srt_retry(
                         failed_entries, log_lines_raw,
@@ -1263,6 +1289,8 @@ Choose the voice source: **Reference Audio** (raw audio) or **Load Voice File** 
                             log_lines.append(f"\n❌ Retry error: {type(e).__name__}: {e}")
                             yield 0, "\n".join(log_lines[-40:]), failed_entries, log_lines, gr.update(visible=True, value=f"🔁 Retry Failed ({len(failed_entries)})")
 
+                    # Step 1: When user clicks "Generate", it starts the first block
+                    # The generator returns the updated state as the final tuple element.
                     srt_btn.click(
                         run_srt_batch,
                         inputs=[
@@ -1270,10 +1298,45 @@ Choose the voice source: **Reference Audio** (raw audio) or **Load Voice File** 
                             srt_lang, srt_instruct,
                             srt_file, srt_out_dir, srt_format,
                             srt_block_size, srt_blocks_sel,
-                            srt_auto_retry,
+                            srt_auto_retry, srt_auto_next, srt_pending_blocks_state, srt_log_state
                         ],
-                        outputs=[srt_progress_bar, srt_status, srt_failed_state, srt_log_state, srt_retry_btn],
+                        outputs=[srt_progress_bar, srt_status, srt_failed_state, srt_log_state, srt_pending_blocks_state],
+                    ).then(
+                        lambda pending, auto_next: gr.update(visible=bool(pending and auto_next)),
+                        inputs=[srt_pending_blocks_state, srt_auto_next],
+                        outputs=[srt_next_trigger]
+                    ).then(
+                        lambda n_failed: gr.update(visible=n_failed > 0, value=f"🔁 Retry Failed ({n_failed})"),
+                        inputs=[lambda f: len(f) if f else 0],
+                        outputs=[srt_retry_btn]
                     )
+
+                    # Step 2: Hidden trigger for next blocks
+                    # Is clicked virtually if the visibility becomes true (which means there are pending blocks and auto_next is True)
+                    srt_next_trigger.change(
+                        lambda is_vis: None if not is_vis else True, # return a dummy to trigger the chain
+                        inputs=[srt_next_trigger], outputs=[]
+                    ).then(
+                        # We pass `is_chain_triggered=True` via lambda: True
+                        run_srt_batch,
+                        inputs=[
+                            srt_ref_audio, srt_ref_text, srt_xvec_only, srt_prompt_file,
+                            srt_lang, srt_instruct,
+                            srt_file, srt_out_dir, srt_format,
+                            srt_block_size, srt_blocks_sel,
+                            srt_auto_retry, srt_auto_next, srt_pending_blocks_state, srt_log_state, gr.State(True)
+                        ],
+                        outputs=[srt_progress_bar, srt_status, srt_failed_state, srt_log_state, srt_pending_blocks_state],
+                    ).then(
+                        lambda pending, auto_next: gr.update(visible=bool(pending and auto_next)),
+                        inputs=[srt_pending_blocks_state, srt_auto_next],
+                        outputs=[srt_next_trigger]
+                    ).then(
+                        lambda n_failed: gr.update(visible=n_failed > 0, value=f"🔁 Retry Failed ({n_failed})"),
+                        inputs=[lambda f: len(f) if f else 0],
+                        outputs=[srt_retry_btn]
+                    )
+
                     srt_retry_btn.click(
                         run_srt_retry,
                         inputs=[srt_failed_state, srt_log_state, srt_ref_audio, srt_ref_text, srt_xvec_only, srt_prompt_file, srt_lang, srt_instruct, srt_out_dir, srt_format],

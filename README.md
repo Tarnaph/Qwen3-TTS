@@ -37,6 +37,7 @@ Esta versão inclui melhorias na interface web (`demo.py`) em relação ao origi
 | **Fix áudio truncado** | `max_new_tokens` calculado por caracteres (`char_count × 12 + 300`) em vez de palavras; cap elevado de 4096 → 8192 para garantir que legendas longas não sejam cortadas |
 | **Log texto completo** | O log exibe o texto integral de cada legenda (>80 chars) para que seja possível verificar o parsing durante o batch |
 | **🧩 Geração por Blocos** | Divide o `.srt` em blocos de N legendas; `CheckboxGroup` atualizado dinamicamente ao carregar o arquivo; gerar um ou mais blocos específicos (desmarcado = gera tudo) |
+| **⏭️ Auto-next block** | Checkbox (default: off) que permite o avanço automático para o próximo bloco após a conclusão, prevenindo VRAM OOM ao limpar cache entre ciclos |
 | **🔄 Auto-retry** | Checkbox (default: off) que, ao ativado, reprocessa automaticamente as legendas falhas ao final do batch, em rounds, até resolver ou sem progresso detectado |
 
 ---
